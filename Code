@@ -249,3 +249,255 @@ def CCI(close,high,low,n):
     empty_list = [None] * (n-1)
     CCI = pd.Series(np.array(empty_list + [CCIInit] + CCI))  
     return CCI
+
+df = pd.read_csv("/dbfs/FileStore/tables/New_ETF.csv")
+
+# Obtención de retornos de precio de cierre.
+a = np.array(df['name'])
+indexes = np.unique(a,return_index="True")[1]
+StockETF = [a[index] for index in sorted(indexes)]
+ReturnsforCorrelation = np.zeros(shape=(len(df['date'].unique())-1,len(StockETF)))
+Close = np.zeros(shape=(len(df['date'].unique()),len(StockETF)))
+new_index = pd.Series(range(0,len(df['date'].unique())))
+
+for i in range(len(StockETF)): #range(len(StockETF))
+    # print("Getting data for " + StockETF[i])
+    close = df[df['name']==StockETF[i]]['close']
+    Close[:,i] = close
+    close.index = (new_index)
+    ReturnsforCorrelation[:,i] = np.diff(np.log(np.array(close, dtype=np.float)))
+
+ReturnsforCorrelation = ReturnsforCorrelation.T
+
+# Normalización de retornos de precios de cierre para determinación de clusters de agrupación.
+ReturnsforCorrelation_Normalized = pd.DataFrame(ReturnsforCorrelation)
+ReturnsforCorrelation_Normalized = pd.DataFrame(StandardScaler().fit_transform(ReturnsforCorrelation_Normalized))
+
+# FASE II #
+# Cálculo de score de Calinski-Harabasz para determinar el número de clusters óptimo.
+K_MAX = 100
+CH = []
+KK = range(2,K_MAX+1)
+
+for k in KK:
+    kmeans =  KMeans(n_clusters=k, random_state=0).fit(ReturnsforCorrelation_Normalized.iloc[:,-30:])
+    labels= kmeans.labels_
+    CH.append(metrics.calinski_harabaz_score(ReturnsforCorrelation_Normalized.iloc[:,-30:],labels))
+    
+fig = plt.figure()
+plt.plot(np.array(range(K_MAX-1)),CH, color='red')
+plt.ylabel('Valor - Calinski-Harabasz Criterion')
+display(fig)
+
+# Labeling Stocks & ETFs
+
+kmeans = KMeans(n_clusters=22, random_state=0).fit(ReturnsforCorrelation_Normalized.iloc[:,-180:])
+labels= kmeans.labels_
+
+labels = pd.DataFrame(labels, columns = ['Type'])
+print labels['Type'].value_counts()
+
+# ANÁLISIS DE RENTABILIDADES POR CLUSTER #
+# I. CLUSTER 0
+# Seleccionar cluster 0
+cluster_0 = labels[labels['Type']==0].index.tolist()
+# Imprimir nombres de ETFs & acciones
+cluster_0_names = list( StockETF[i] for i in cluster_0 )
+print cluster_0_names
+# Imprimir posiciones de clusters
+print(cluster_0)
+
+# Mostrar gráfico con fechas y sector económico
+# https://pandas.pydata.org/pandas-docs/stable/visualization.html
+def cumulative_percentage(x):
+    f = np.zeros(shape=(len(x)+1,1))
+    f[0]=100
+    for i in range(1,len(x)):
+        f[i] = f[i-1]*(1+x[i-1])
+    return f
+Cluster_Data = pd.DataFrame(ReturnsforCorrelation).iloc[labels[labels['Type']==0].index,:].T
+fig = plt.figure()
+for k in range(Cluster_Data.shape[1]):
+     plt.plot(np.array(df['date'].unique(), dtype='datetime64[D]'),cumulative_percentage(Cluster_Data.iloc[:,k]))
+plt.show()
+display(fig)
+
+# El número mínimo de observaciones para calcular los índices de análisis técnico es 21.
+features_size = len(df['date'].unique())-21
+# Se calculan 27 features y el vector de la variable dependiente
+Total_Data = np.zeros(shape=(features_size*len(cluster_0_names),1+27))
+stock_ranges = []
+for i in range(len(cluster_0_names)):
+    print("Calculating features for: " + cluster_0_names[i])
+    close = df[df['name']==cluster_0_names[i]]['close']
+    close.index = (new_index)
+    high = df[df['name']==cluster_0_names[i]]['high']
+    high.index = (new_index)
+    low = df[df['name']==cluster_0_names[i]]['low']
+    low.index = (new_index)
+    # Construcción de indicadores de análisis técnico
+    features = pd.concat([CCI(close,high,low,6),CCI(close,high,low,9),CCI(close,high,low,14),CCI(close,high,low,21),
+           price_change(close,1),price_change(close,2),price_change(close,3),SMA(close,6),SMA(close,9),
+           SMA(close,14),SMA(close,21),ROC(close,6),ROC(close,9),ROC(close,14),ROC(close,21),
+           RSI(close,6),RSI(close,9),RSI(close,14),RSI(close,21), STO(close, high, low,6),
+           STO(close, high, low,9), STO(close, high, low,14), STO(close, high, low,21),
+           ATR(close,high,low,6),ATR(close,high,low,9),ATR(close,high,low,14),ATR(close,high,low,21)], axis = 1)
+    features = pd.DataFrame(StandardScaler().fit_transform(features[21:])) #features usado para clasificar
+    # Detección de picos de compra y venta de acciones/ETFs
+    label = np.zeros(dtype=np.chararray, shape=(len(new_index),1))
+    peaks = peakdetect(close, lookahead = int(1.25), delta= 1)
+    Sell = np.array([x[0] for x in peaks[0]])
+    if len(Sell)>0:
+       label[Sell]= 1 #"Sell"
+    Buy =  np.array([x[0] for x in peaks[1]])
+    if len(Buy)>0:
+       label[Buy]= 2 #"Buy"
+    label[label == 0] = 3 #"Hold"
+    label = pd.DataFrame(label[21:]) #label usado para clasificación
+    row = np.array(range(features_size*(i),features_size*(i+1)),dtype=np.intp)
+    stock_ranges.append(row)
+    col = np.array(range(0,1+27),dtype=np.intp)
+    Total_Data[row[:,np.newaxis],col] = pd.concat([label,features], axis = 1, ignore_index = True)
+    
+column_names = ['label_f','CCI6','CCI9','CCI14','CCI21','Price_Change1','Price_Change2','Price_Change3',
+               'SMA6','SMA9','SMA14','SMA21','ROC6','ROC9','ROC14','ROC21','RSI6','RSI9','RSI14','RSI21',
+               'STO6','STO9','STO14','STO21','ATR6','ATR9','ATR14','ATR21']
+Total_Data = pd.DataFrame(Total_Data, columns = column_names)
+buyAndSell = Total_Data['label_f'].value_counts()[1] + Total_Data['label_f'].value_counts()[2]
+hold = np.int64( buyAndSell / 0.4 * 0.6 )
+totalData = Total_Data.loc[Total_Data['label_f'].isin( [1, 2] )]
+valuesByStock = hold / len( stock_ranges )
+for stockIndexes in stock_ranges:
+    count = 0
+    for index in stockIndexes[::-1]:
+        if count == valuesByStock:
+          break
+        if Total_Data.loc[index]['label_f'] == 3:
+          count += 1
+          totalData = totalData.append(Total_Data.loc[index])
+
+# Conversión a Spark #
+Total_Data_Spark = sqlContext.createDataFrame(totalData)
+display(Total_Data_Spark)
+
+# Importación de librerías y funciones del ejercicio de clasificación #
+
+from pyspark.ml.classification import MultilayerPerceptronClassifier
+from pyspark.ml.evaluation import BinaryClassificationEvaluator
+from pyspark.mllib.evaluation import BinaryClassificationMetrics
+from pyspark.ml.evaluation import MulticlassClassificationEvaluator
+from pyspark.mllib.evaluation import MulticlassMetrics
+from pyspark.sql.types import DoubleType
+from pyspark.ml.feature import StringIndexer
+from pyspark.ml.feature import VectorAssembler
+
+# Se define el cálculo del área bajo la curva, el accuracy, la precisión, el recall y el F1-Score.
+def evaluate(model, testSet):
+  predictions = model.transform(testSet)
+  # display(predictions)
+  evaluator = MulticlassClassificationEvaluator(labelCol="label", predictionCol="prediction",
+                                             metricName="accuracy")
+  accuracy = evaluator.evaluate(predictions)
+  print("Test set accuracy = " + str(accuracy))
+  rddPred = predictions.select('prediction', 'label').withColumn('label', predictions.label.cast(DoubleType())).rdd
+  metrics = MulticlassMetrics(rddPred)
+  precision = metrics.precision()
+  recall = metrics.recall()
+  f1Score = metrics.fMeasure()
+  print("Precision = %s" % precision)
+  print("Recall = %s" % recall)
+  print("F1 Score = %s" % f1Score)
+def print_confusion_matrix(model, testSet):
+  prediction = model.transform(testSet)
+  rddPred = prediction.select('prediction', 'label').withColumn('label', prediction.label.cast(DoubleType())).rdd
+  metrics = MulticlassMetrics(rddPred)
+  print(metrics.confusionMatrix())
+dataset = StringIndexer(inputCol="label_f", outputCol="label").fit(Total_Data_Spark).transform(Total_Data_Spark)
+dataset = VectorAssembler(inputCols=column_names[1:],outputCol="features").transform(dataset)
+dataset = dataset.select(["label","features"])
+(trainSet, testSet) = dataset.randomSplit([0.7, 0.3], seed=100)
+display (dataset)
+display(testSet)
+testSet.groupBy('label').count().show()
+
+# specify layers for the neural network :
+# input layer of size 4 (features), two intermediate of size 5 and 4
+# and output of size 3 (classes)
+layers = [27, 5, 4, 3]
+# create the trainer and set its parameters
+trainer = MultilayerPerceptronClassifier(maxIter=100, layers=layers, blockSize=128, seed=1234)
+model = trainer.fit(trainSet)
+evaluate(model, testSet)
+print_confusion_matrix(model, testSet) #Filas: Observada; Columnas: Valor Predicho.
+
+# Determinar importancia de atributos en la clasificación #
+# Vector = model.featureImportances()
+# print Vector
+# II. RESTO DE CLUSTERS: 3, 13, 16, 1, 7, 10, 8, 14, 5
+
+cluster = labels[labels['Type']==g].index.tolist()
+cluster_names = list( StockETF[i] for i in cluster )
+Cluster_Data = pd.DataFrame(ReturnsforCorrelation).iloc[labels[labels['Type']==g].index,:].T
+features_size = len(df['date'].unique())-21
+# Se calculan 27 features y el vector de la variable dependiente
+Total_Data = np.zeros(shape=(features_size*len(cluster_names),1+27))
+stock_ranges = []
+for i in range(len(cluster_names)):
+    print("Calculating features for: " + cluster_names[i])
+    close = df[df['name']==cluster_names[i]]['close']
+    close.index = (new_index)
+    high = df[df['name']==cluster_names[i]]['high']
+    high.index = (new_index)
+    low = df[df['name']==cluster_names[i]]['low']
+    low.index = (new_index)
+    # Construcción de indicadores de análisis técnico
+    features = pd.concat([CCI(close,high,low,6),CCI(close,high,low,9),CCI(close,high,low,14),CCI(close,high,low,21),
+           price_change(close,1),price_change(close,2),price_change(close,3),SMA(close,6),SMA(close,9),
+           SMA(close,14),SMA(close,21),ROC(close,6),ROC(close,9),ROC(close,14),ROC(close,21),
+           RSI(close,6),RSI(close,9),RSI(close,14),RSI(close,21), STO(close, high, low,6),
+           STO(close, high, low,9), STO(close, high, low,14), STO(close, high, low,21),
+           ATR(close,high,low,6),ATR(close,high,low,9),ATR(close,high,low,14),ATR(close,high,low,21)], axis = 1)
+    features = pd.DataFrame(StandardScaler().fit_transform(features[21:])) #features usado para clasificar
+    # Detección de picos de compra y venta de acciones/ETFs
+    label = np.zeros(dtype=np.chararray, shape=(len(new_index),1))
+    peaks = peakdetect(close, lookahead = int(1.25), delta= 1)
+    Sell = np.array([x[0] for x in peaks[0]])
+    if len(Sell)>0:
+       label[Sell]= 1 #"Sell"
+    Buy =  np.array([x[0] for x in peaks[1]])
+    if len(Buy)>0:
+       label[Buy]= 2 #"Buy"
+    label[label == 0] = 3 #"Hold"
+    label = pd.DataFrame(label[21:]) #label usado para clasificación
+    row = np.array(range(features_size*(i),features_size*(i+1)),dtype=np.intp)
+    stock_ranges.append(row)
+    col = np.array(range(0,1+27),dtype=np.intp)
+    Total_Data[row[:,np.newaxis],col] = pd.concat([label,features], axis = 1, ignore_index = True)
+
+column_names = ['label_f','CCI6','CCI9','CCI14','CCI21','Price_Change1','Price_Change2','Price_Change3',
+               'SMA6','SMA9','SMA14','SMA21','ROC6','ROC9','ROC14','ROC21','RSI6','RSI9','RSI14','RSI21',
+               'STO6','STO9','STO14','STO21','ATR6','ATR9','ATR14','ATR21']
+Total_Data = pd.DataFrame(Total_Data, columns = column_names)
+buyAndSell = Total_Data['label_f'].value_counts()[1] + Total_Data['label_f'].value_counts()[2]
+hold = np.int64( buyAndSell / 0.4 * 0.6 )
+totalData = Total_Data.loc[Total_Data['label_f'].isin( [1, 2] )]
+valuesByStock = hold / len( stock_ranges )
+for stockIndexes in stock_ranges:
+    count = 0
+    for index in stockIndexes[::-1]:
+        if count == valuesByStock:
+          break
+        if Total_Data.loc[index]['label_f'] == 3:
+          count += 1
+          totalData = totalData.append(Total_Data.loc[index])
+Total_Data_Spark = sqlContext.createDataFrame(totalData)
+dataset = StringIndexer(inputCol="label_f", outputCol="label").fit(Total_Data_Spark).transform(Total_Data_Spark)
+dataset = VectorAssembler(inputCols=column_names[1:],outputCol="features").transform(dataset)
+dataset = dataset.select(["label","features"])
+(trainSet, testSet) = dataset.randomSplit([0.7, 0.3], seed=100)
+layers = [27, 5, 4, 3]
+# create the trainer and set its parameters
+trainer = MultilayerPerceptronClassifier(maxIter=100, layers=layers, blockSize=128, seed=1234)
+model = trainer.fit(trainSet)
+evaluate(model, testSet)
+print_confusion_matrix(model, testSet)
